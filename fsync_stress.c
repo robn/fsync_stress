@@ -1,0 +1,332 @@
+#include <stdint.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <pthread.h>
+
+static void
+usage()
+{
+	fprintf(stderr,
+	    "usage: fsync_stress [-n numthreads] [-t timeout] <basedir>\n");
+	exit(1);
+}
+
+static int
+fill_random(uint8_t *v, size_t sz)
+{
+	int fd = open("/dev/urandom", O_RDONLY);
+	if (fd < 0)
+		return (errno);
+
+	while (sz > 0) {
+		ssize_t r = read(fd, v, sz);
+		if (r < 0) {
+			close(fd);
+			return (errno);
+		}
+		v += r;
+		sz -= r;
+	}
+
+	close(fd);
+
+	return (0);
+}
+
+typedef struct {
+	int basedirfd;
+	size_t minsz;
+	size_t maxsz;
+	const uint8_t *data;
+	size_t datasz;
+} file_opts_t;
+
+typedef enum {
+	F_ST_OPEN = 0,
+	F_ST_HEADER,
+	F_ST_DATA,
+	F_ST_FOOTER,
+	F_ST_RENAME,
+	F_ST_FSYNC,
+	F_ST_CLOSE,
+	F_ST_DONE,
+} file_state_t;
+
+const char *file_state_str[] = {
+	"OPEN",
+	"HEADER",
+	"DATA",
+	"FOOTER",
+	"RENAME",
+	"FSYNC",
+	"CLOSE",
+	"DONE",
+};
+
+typedef struct {
+	void *next;
+	unsigned int filenum;
+	file_state_t state;
+	size_t filesz;
+	int err;
+} file_result_t;
+
+const char footer[] = "ENDOFLINE";
+
+atomic_uint t_filenum;
+atomic_bool t_exit;
+atomic_uint t_exited;
+
+file_result_t *results = NULL;
+pthread_mutex_t results_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t results_cv = PTHREAD_COND_INITIALIZER;
+
+static void *
+file_thread(void *arg)
+{
+	const file_opts_t *opts = arg;
+
+	char filename[32];
+	char filename_tmp[32];
+
+	while (!atomic_load(&t_exit)) {
+		file_result_t *res = calloc(1, sizeof (file_result_t));
+
+		res->filenum = atomic_fetch_add(&t_filenum, 1);
+		snprintf(filename, sizeof (filename), "%u", res->filenum);
+		snprintf(filename_tmp, sizeof (filename), "%u.tmp", res->filenum);
+
+		res->filesz =
+		    (random() % (opts->maxsz-opts->minsz)) + opts->minsz;
+
+		res->state = F_ST_OPEN;
+		int fd = openat(opts->basedirfd, filename_tmp,
+		    O_CREAT|O_WRONLY, S_IRUSR|S_IWUSR);
+		if (fd < 0) {
+			res->err = errno;
+			goto ferr;
+		}
+
+		res->state++;
+		int nw = write(fd, &res->filesz, sizeof (size_t));
+		if (nw < 0) {
+			res->err = errno;
+			goto ferr;
+		}
+
+		res->state++;
+		size_t rem = res->filesz;
+		while (rem > 0) {
+			nw = write(fd, &opts->data[res->filesz-rem], rem);
+			if (nw < 0) {
+				res->err = errno;
+				goto ferr;
+			}
+			rem -= nw;
+		}
+
+		res->state++;
+		nw = write(fd, footer, sizeof (footer));
+		if (nw < 0) {
+			res->err = errno;
+			goto ferr;
+		}
+
+		res->state++;
+		if (renameat(opts->basedirfd, filename_tmp,
+		    opts->basedirfd, filename) < 0) {
+			res->err = errno;
+			goto ferr;
+		}
+
+		res->state++;
+		if (close(fd) < 0)
+			res->err = errno;
+		else
+			res->state++;
+
+ferr:
+		if (res->state < F_ST_CLOSE)
+			close(fd);
+
+		pthread_mutex_lock(&results_lock);
+		res->next = results;
+		results = res;
+		pthread_cond_signal(&results_cv);
+		pthread_mutex_unlock(&results_lock);
+	}
+
+	atomic_fetch_add(&t_exited, 1);
+	pthread_cond_signal(&results_cv);
+
+	return (NULL);
+}
+
+int
+main(int argc, char **argv)
+{
+	char *basedir = NULL;
+	int nthreads = 10;
+	time_t runtime = 1;
+
+	int c;
+	while ((c = getopt(argc, argv, "n:t:")) != -1) {
+		switch (c) {
+		case 'n':
+			nthreads = atoi(optarg);
+			if (nthreads <= 0) {
+				fprintf(stderr, "E: invalid number of threads: "
+				    "%s\n", optarg);
+				usage();
+			}
+			break;
+		case 't':
+			runtime = atoi(optarg);
+			if (runtime <= 0) {
+				fprintf(stderr, "E: invalid run time: %s\n",
+				    optarg);
+				usage();
+			}
+			break;
+		default:
+			usage();
+		}
+	}
+
+	argc -= optind;
+	argv += optind;
+
+	if (argc != 1)
+		usage();
+
+	basedir = argv[0];
+
+	srandom(time(NULL));
+
+	atomic_init(&t_filenum, 0);
+	atomic_init(&t_exit, 0);
+	atomic_init(&t_exited, 0);
+
+	size_t datasz = 16*1024*1024;
+	uint8_t *data = NULL;
+	int basedirfd = -1;
+	int rc = 3;
+
+	basedirfd = open(basedir, O_DIRECTORY);
+	if (basedirfd < 0) {
+		fprintf(stderr, "E: couldn't open dir %s: %s\n",
+		    basedir, strerror(errno));
+		goto out;
+	}
+
+	data = malloc(datasz);
+	if (data == NULL) {
+		fprintf(stderr, "E: couldn't allocate file data memory: %s\n",
+		    strerror(errno));
+		goto out;
+	}
+	int err = fill_random(data, datasz);
+	if (err != 0) {
+		fprintf(stderr, "E: couldn't fill random data: %s\n",
+		    strerror(err));
+		goto out;
+	}
+
+	rc = 0;
+
+	struct timespec timeout = {
+		.tv_sec = time(NULL) + runtime,
+		.tv_nsec = 0,
+	};
+
+	file_opts_t opts = {
+		.basedirfd = basedirfd,
+		.minsz = 4096,
+		.maxsz = datasz,
+		.data = data,
+		.datasz = datasz,
+	};
+
+	pthread_t *threads = malloc(nthreads * sizeof (pthread_t));
+	for (int i = 0; i < nthreads; i++) {
+		err = pthread_create(&threads[i], NULL, file_thread, &opts);
+		if (err != 0) {
+			fprintf(stderr, "E: couldn't create thread %d: %s\n",
+			    i, strerror(err));
+			rc = 2;
+			goto out;
+		}
+	}
+
+	enum { RUNNING, EXITING, DONE, TIMEDOUT } runstate = RUNNING;
+	while (runstate < DONE) {
+		file_result_t *res = NULL;
+
+		pthread_mutex_lock(&results_lock);
+		while (results == NULL && runstate < DONE) {
+			int err = pthread_cond_timedwait(
+			    &results_cv, &results_lock, &timeout);
+			if (err != 0) {
+				if (err != ETIMEDOUT) {
+					fprintf(stderr, "E: condvar wait "
+					    "failed: %s\n", strerror(errno));
+					rc = 2;
+					goto out;
+				}
+
+				if (runstate == RUNNING) {
+					atomic_store(&t_exit, 1);
+					timeout.tv_sec += 10;
+					runstate = EXITING;
+				} else {
+					runstate = TIMEDOUT;
+				}
+			}
+		}
+
+		res = results;
+		results = NULL;
+		pthread_mutex_unlock(&results_lock);
+
+		while (res != NULL) {
+			printf("%s: filenum=%u state=%s size=%lu err=%d\n",
+			    res->err == 0 ? "OK" : "FAIL", res->filenum,
+			    file_state_str[res->state], res->filesz, res->err);
+			void *next = res->next;
+			free(res);
+			res = next;
+		}
+
+		if (atomic_load(&t_exited) == nthreads) {
+			if (results != NULL)
+				runstate = EXITING;
+			else
+				runstate = DONE;
+		}
+	}
+
+	if (runstate == TIMEDOUT) {
+		fprintf(stderr, "W: not all threads returned after exit "
+		    "signal; are they stuck? exiting without cleanup\n");
+		rc = 5;
+		goto out;
+	}
+
+	for (int i = 0; i < nthreads; i++)
+	    pthread_join(threads[i], NULL);
+
+	free(threads);
+
+out:
+	if (data != NULL)
+		free(data);
+	if (basedirfd >= 0)
+		close(basedirfd);
+
+	return (rc);
+}
