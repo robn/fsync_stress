@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <sys/stat.h>
 
 static void
 usage()
@@ -47,7 +48,8 @@ typedef struct {
 } file_opts_t;
 
 typedef enum {
-	F_ST_OPEN = 0,
+	F_ST_SETUP = 0,
+	F_ST_OPEN,
 	F_ST_HEADER,
 	F_ST_DATA,
 	F_ST_FOOTER,
@@ -58,6 +60,7 @@ typedef enum {
 } file_state_t;
 
 const char *file_state_str[] = {
+	"SETUP",
 	"OPEN",
 	"HEADER",
 	"DATA",
@@ -91,21 +94,47 @@ file_thread(void *arg)
 {
 	const file_opts_t *opts = arg;
 
+	char dirname[32];
 	char filename[32];
 	char filename_tmp[32];
 
 	while (!atomic_load(&t_exit)) {
+		int fd = -1, dirfd = -1;
+
 		file_result_t *res = calloc(1, sizeof (file_result_t));
 
 		res->filenum = atomic_fetch_add(&t_filenum, 1);
+		res->state = F_ST_SETUP;
+
+		snprintf(dirname, sizeof (dirname), "d%03u",
+		    res->filenum % 1000);
+		dirfd = openat(opts->basedirfd, dirname, O_DIRECTORY);
+		if (dirfd < 0) {
+			if (errno != ENOENT) {
+				res->err = errno;
+				goto ferr;
+			}
+			if (mkdirat(opts->basedirfd, dirname, S_IRWXU) < 0) {
+				if (errno != EEXIST) {
+					res->err = errno;
+					goto ferr;
+				}
+			}
+			dirfd = openat(opts->basedirfd, dirname, O_DIRECTORY);
+			if (dirfd < 0) {
+				res->err = errno;
+				goto ferr;
+			}
+		}
+
 		snprintf(filename, sizeof (filename), "%u", res->filenum);
 		snprintf(filename_tmp, sizeof (filename), "%u.tmp", res->filenum);
 
 		res->filesz =
 		    (random() % (opts->maxsz-opts->minsz)) + opts->minsz;
 
-		res->state = F_ST_OPEN;
-		int fd = openat(opts->basedirfd, filename_tmp,
+		res->state++;
+		fd = openat(dirfd, filename_tmp,
 		    O_CREAT|O_WRONLY, S_IRUSR|S_IWUSR);
 		if (fd < 0) {
 			res->err = errno;
@@ -138,8 +167,7 @@ file_thread(void *arg)
 		}
 
 		res->state++;
-		if (renameat(opts->basedirfd, filename_tmp,
-		    opts->basedirfd, filename) < 0) {
+		if (renameat(dirfd, filename_tmp, dirfd, filename) < 0) {
 			res->err = errno;
 			goto ferr;
 		}
@@ -149,10 +177,13 @@ file_thread(void *arg)
 			res->err = errno;
 		else
 			res->state++;
+		fd = -1;
 
 ferr:
-		if (res->state < F_ST_CLOSE)
+		if (fd >= 0)
 			close(fd);
+		if (dirfd >= 0)
+			close(dirfd);
 
 		pthread_mutex_lock(&results_lock);
 		res->next = results;
