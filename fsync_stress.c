@@ -43,6 +43,7 @@ usage()
 {
 	fprintf(stderr,
 	    "usage: fsync_stress "
+	    "[-o resultfile] "
 	    "[-n numthreads] [-t timeout] "
 	    "[-m minsz] [-M maxsz] <basedir>\n");
 	exit(1);
@@ -232,14 +233,18 @@ ferr:
 int
 main(int argc, char **argv)
 {
+	char *resultfile = "result.log";
 	char *basedir = NULL;
 	int nthreads = 10;
 	time_t runtime = 1;
 	size_t minsz = 1024, maxsz = 1408*1024;
 
 	int c;
-	while ((c = getopt(argc, argv, "n:t:m:M:")) != -1) {
+	while ((c = getopt(argc, argv, "o:n:t:m:M:")) != -1) {
 		switch (c) {
+		case 'o':
+			resultfile = optarg;
+			break;
 		case 'n':
 			nthreads = atoi(optarg);
 			if (nthreads <= 0) {
@@ -303,6 +308,8 @@ main(int argc, char **argv)
 	size_t datasz = 16*1024*1024;
 	uint8_t *data = NULL;
 	int basedirfd = -1;
+	int resultfd = -1;
+	FILE *resultfh = NULL;
 	int rc = 3;
 
 	basedirfd = open(basedir, O_DIRECTORY);
@@ -324,6 +331,14 @@ main(int argc, char **argv)
 		    strerror(err));
 		goto out;
 	}
+
+	resultfd = open(resultfile, O_CREAT|O_TRUNC|O_WRONLY, S_IRUSR|S_IWUSR);
+	if (resultfd < 0) {
+		fprintf(stderr, "E: couldn't open result file %s: %s\n",
+		    resultfile, strerror(errno));
+		goto out;
+	}
+	resultfh = fdopen(resultfd, "w");
 
 	rc = 0;
 
@@ -382,7 +397,8 @@ main(int argc, char **argv)
 		pthread_mutex_unlock(&results_lock);
 
 		while (res != NULL) {
-			printf("%s: filenum=%u state=%s size=%lu err=%d\n",
+			fprintf(resultfh,
+			    "%s: filenum=%u state=%s size=%lu err=%d\n",
 			    res->err == 0 ? "OK" : "FAIL", res->filenum,
 			    file_state_str[res->state], res->filesz, res->err);
 			void *next = res->next;
@@ -411,6 +427,10 @@ main(int argc, char **argv)
 	free(threads);
 
 out:
+	if (resultfh != NULL)
+		fclose(resultfh);
+	if (resultfd >= 0)
+		close(resultfd);
 	if (data != NULL)
 		free(data);
 	if (basedirfd >= 0)
