@@ -42,7 +42,9 @@ static void
 usage()
 {
 	fprintf(stderr,
-	    "usage: fsync_stress [-n numthreads] [-t timeout] <basedir>\n");
+	    "usage: fsync_stress "
+	    "[-n numthreads] [-t timeout] "
+	    "[-m minsz] [-M maxsz] <basedir>\n");
 	exit(1);
 }
 
@@ -160,7 +162,7 @@ file_thread(void *arg)
 		snprintf(filename_tmp, sizeof (filename), "%u.tmp", res->filenum);
 
 		res->filesz =
-		    (random() % (opts->maxsz-opts->minsz)) + opts->minsz;
+		    (random() % (opts->maxsz+1-opts->minsz)) + opts->minsz;
 
 		res->state++;
 		fd = openat(dirfd, filename_tmp,
@@ -233,9 +235,10 @@ main(int argc, char **argv)
 	char *basedir = NULL;
 	int nthreads = 10;
 	time_t runtime = 1;
+	size_t minsz = 1024, maxsz = 1408*1024;
 
 	int c;
-	while ((c = getopt(argc, argv, "n:t:")) != -1) {
+	while ((c = getopt(argc, argv, "n:t:m:M:")) != -1) {
 		switch (c) {
 		case 'n':
 			nthreads = atoi(optarg);
@@ -253,9 +256,34 @@ main(int argc, char **argv)
 				usage();
 			}
 			break;
+		case 'm':
+			minsz = atoll(optarg);
+			if (minsz <= 0) {
+				fprintf(stderr, "E: invalid min size: %s\n",
+				    optarg);
+				usage();
+			}
+			break;
+		case 'M':
+			maxsz = atoll(optarg);
+			if (maxsz <= 0) {
+				fprintf(stderr, "E: invalid max size: %s\n",
+				    optarg);
+				usage();
+			}
+			break;
 		default:
 			usage();
 		}
+	}
+
+	if (minsz > maxsz) {
+		fprintf(stderr, "E: min size must be <= max size\n");
+		usage();
+	}
+	if (maxsz > 16*1024*1024) {
+		fprintf(stderr, "E: max size must be <= 16M\n");
+		usage();
 	}
 
 	argc -= optind;
@@ -306,8 +334,8 @@ main(int argc, char **argv)
 
 	file_opts_t opts = {
 		.basedirfd = basedirfd,
-		.minsz = 4096,
-		.maxsz = datasz,
+		.minsz = minsz,
+		.maxsz = maxsz,
 		.data = data,
 		.datasz = datasz,
 	};
