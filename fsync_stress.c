@@ -205,7 +205,7 @@ file_thread(void *arg)
 		}
 
 		res->state++;
-		nw = write(fd, footer, sizeof (footer));
+		nw = write(fd, footer, strlen(footer));
 		if (nw < 0) {
 			res->err = errno;
 			goto ferr;
