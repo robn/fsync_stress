@@ -42,10 +42,11 @@ static void
 usage()
 {
 	fprintf(stderr,
-	    "usage: fsync_stress "
-	    "[-o resultfile] "
-	    "[-n numthreads] [-t timeout] "
-	    "[-m minsz] [-M maxsz] <basedir>\n");
+	    "usage:\n"
+	    "  fsync_stress -T [-n numthreads] [-t timeout]\n"
+	    "                  [-m minsz] [-M maxsz]\n"
+	    "                  <basedir> <resultfile>\n"
+	    "  fsync_stress -R <basedir> <resultfile>\n");
 	exit(1);
 }
 
@@ -116,7 +117,7 @@ typedef struct {
 	void *next;
 	unsigned int filenum;
 	file_state_t state;
-	size_t filesz;
+	size_t datasz;
 	int err;
 	uint64_t ns;
 } file_result_t;
@@ -173,7 +174,7 @@ file_thread(void *arg)
 		snprintf(filename, sizeof (filename), "%u", res->filenum);
 		snprintf(filename_tmp, sizeof (filename), "%u.tmp", res->filenum);
 
-		res->filesz =
+		res->datasz =
 		    (random() % (opts->maxsz+1-opts->minsz)) + opts->minsz;
 
 		start_ns = now_ns();
@@ -187,16 +188,16 @@ file_thread(void *arg)
 		}
 
 		res->state++;
-		int nw = write(fd, &res->filesz, sizeof (size_t));
+		int nw = write(fd, &res->datasz, sizeof (size_t));
 		if (nw < 0) {
 			res->err = errno;
 			goto ferr;
 		}
 
 		res->state++;
-		size_t rem = res->filesz;
+		size_t rem = res->datasz;
 		while (rem > 0) {
-			nw = write(fd, &opts->data[res->filesz-rem], rem);
+			nw = write(fd, &opts->data[res->datasz-rem], rem);
 			if (nw < 0) {
 				res->err = errno;
 				goto ferr;
@@ -252,28 +253,30 @@ ferr:
 	return (NULL);
 }
 
+
+static int report_main(const char *basedir, const char *resultfile);
+
 int
 main(int argc, char **argv)
 {
-	char *resultfile = "result.log";
 	char *basedir = NULL;
+	char *resultfile = NULL;
+	int do_test = 0, do_report = 0;
 	int nthreads = 10;
 	time_t runtime = 1;
 	size_t minsz = 1024, maxsz = 1408*1024;
 
 	int c;
-	while ((c = getopt(argc, argv, "o:n:t:m:M:")) != -1) {
+	while ((c = getopt(argc, argv, "TRn:t:m:M:")) != -1) {
 		switch (c) {
-		case 'o':
-			resultfile = optarg;
+		case 'T':
+			do_test = 1;
+			break;
+		case 'R':
+			do_report = 1;
 			break;
 		case 'n':
 			nthreads = atoi(optarg);
-			if (nthreads <= 0) {
-				fprintf(stderr, "E: invalid number of threads: "
-				    "%s\n", optarg);
-				usage();
-			}
 			break;
 		case 't':
 			runtime = atoi(optarg);
@@ -285,41 +288,60 @@ main(int argc, char **argv)
 			break;
 		case 'm':
 			minsz = atoll(optarg);
-			if (minsz <= 0) {
-				fprintf(stderr, "E: invalid min size: %s\n",
-				    optarg);
-				usage();
-			}
 			break;
 		case 'M':
 			maxsz = atoll(optarg);
-			if (maxsz <= 0) {
-				fprintf(stderr, "E: invalid max size: %s\n",
-				    optarg);
-				usage();
-			}
 			break;
 		default:
 			usage();
 		}
 	}
 
-	if (minsz > maxsz) {
-		fprintf(stderr, "E: min size must be <= max size\n");
-		usage();
-	}
-	if (maxsz > 16*1024*1024) {
-		fprintf(stderr, "E: max size must be <= 16M\n");
-		usage();
-	}
-
 	argc -= optind;
 	argv += optind;
 
-	if (argc != 1)
+	if (argc != 2)
 		usage();
 
 	basedir = argv[0];
+	resultfile = argv[1];
+
+	if (!do_test && !do_report) {
+		fprintf(stderr, "E: must supply a mode flag, -T or -R\n");
+		usage();
+	}
+	if (do_test && do_report) {
+		fprintf(stderr,
+		    "E: mode flags -T and -R can't be used together\n");
+		usage();
+	}
+
+	if (do_test) {
+		if (nthreads <= 0) {
+			fprintf(stderr,
+			    "E: invalid number of threads: %d\n", nthreads);
+			usage();
+		}
+		if (minsz <= 0) {
+			fprintf(stderr, "E: invalid min size: %ld\n", minsz);
+			usage();
+		}
+		if (maxsz <= 0) {
+			fprintf(stderr, "E: invalid max size: %ld\n", maxsz);
+			usage();
+		}
+		if (minsz > maxsz) {
+			fprintf(stderr, "E: min size must be <= max size\n");
+			usage();
+		}
+		if (maxsz > 16*1024*1024) {
+			fprintf(stderr, "E: max size must be <= 16M\n");
+			usage();
+		}
+	}
+
+	if (do_report)
+		return (report_main(basedir, resultfile));
 
 	srandom(time(NULL));
 
@@ -422,7 +444,7 @@ main(int argc, char **argv)
 			fprintf(resultfh, "%s: filenum=%u state=%s size=%lu "
 			    "err=%d ns=%lu\n",
 			    res->err == 0 ? "OK" : "FAIL", res->filenum,
-			    file_state_str[res->state], res->filesz, res->err,
+			    file_state_str[res->state], res->datasz, res->err,
 			    res->ns / 1000);
 			void *next = res->next;
 			free(res);
@@ -457,6 +479,240 @@ out:
 		close(resultfd);
 	if (data != NULL)
 		free(data);
+	if (basedirfd >= 0)
+		close(basedirfd);
+
+	return (rc);
+}
+
+typedef enum {
+	/*
+	 * fsync never called or returned failure, application has no reason
+	 * to expect file is in any particular state.
+	 */
+	F_CR_UNINTERESTING,
+
+	/* fsync succeeded, file is properly on disk */
+	F_CR_CORRECT,
+
+	/* fsync succeeded, file is not correctly on disk */
+	F_CR_BROKEN,
+} file_check_result_t;
+
+static file_check_result_t
+check_one_result(int basedirfd, const file_result_t *res)
+{
+	/*
+	 * we only need to consider files that fsync() returned success for.
+	 * any others either fsync() failed, or was never called, and so the
+	 * filesystem made no promises.
+	 */
+	if (res->state < F_ST_CLOSE)
+		return (F_CR_UNINTERESTING);
+
+	char filepath[64];
+	snprintf(filepath, sizeof (filepath), "d%03u/%u",
+	    res->filenum % 1000, res->filenum);
+
+	int fd = openat(basedirfd, filepath, O_RDONLY);
+	if (fd < 0) {
+		if (errno == ENOENT)
+			/* never made it */
+			goto broken;
+		fprintf(stderr, "check_one_result: openat(%s) = %s\n",
+		    filepath, strerror(errno));
+		goto broken;
+	}
+
+	struct stat st;
+	if (fstat(fd, &st) < 0) {
+		fprintf(stderr, "check_one_result: fstat(%s) = %s\n",
+		    filepath, strerror(errno));
+		goto broken;
+	}
+
+	if (st.st_size != res->datasz + 8 + 9) {
+		/* size mismatch */
+		goto broken;
+	}
+
+	size_t datasz;
+	ssize_t n = read(fd, &datasz, sizeof (size_t));
+	if (n < 0 || n != sizeof (size_t)) {
+		fprintf(stderr, "check_one_result: read(%s)[H] = %s\n",
+		    filepath, n < 0 ? strerror(errno) : "[short read]");
+		goto broken;
+	}
+
+	if (datasz != res->datasz) {
+		fprintf(stderr, "check_one_result: %s: datasize mismatch: "
+		    "header=%lu log=%lu\n", filepath, datasz, res->datasz);
+		goto broken;
+	}
+
+	if (lseek(fd, datasz, SEEK_CUR) < 0) {
+		fprintf(stderr, "check_one_result: seek(%s) = %s\n",
+		    filepath, strerror(errno));
+		goto broken;
+	}
+
+	char footer[9];
+	n = read(fd, &footer, sizeof (footer));
+	if (n < 0 || n != sizeof (footer)) {
+		fprintf(stderr, "check_one_result: read(%s)[F] = %s\n",
+		    filepath, n < 0 ? strerror(errno) : "[short read]");
+		goto broken;
+	}
+
+	if (strncmp(footer, "ENDOFLINE", sizeof (footer)) != 0) {
+		fprintf(stderr,
+		    "check_one_result: %s: footer mismatch\n", filepath);
+		goto broken;
+	}
+
+	close(fd);
+	return (F_CR_CORRECT);
+
+broken:
+	close(fd);
+	return (F_CR_BROKEN);
+}
+
+#define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))
+
+static int
+report_main(const char *basedir, const char *resultfile)
+{
+	int rc = 0;
+	int basedirfd = -1;
+	FILE *fh = NULL;
+	char *linebuf = NULL;
+	size_t linebufsz = 0;
+
+	basedirfd = open(basedir, O_DIRECTORY);
+	if (basedirfd < 0) {
+		fprintf(stderr, "E: couldn't open dir %s: %s\n",
+		    basedir, strerror(errno));
+		rc = 1;
+		goto out;
+	}
+
+	fh = fopen(resultfile, "r");
+	if (fh == NULL) {
+		fprintf(stderr, "E: couldn't open result file %s: %s\n",
+		    resultfile, strerror(errno));
+		rc = 1;
+		goto out;
+	}
+
+	unsigned int total = 0, uninteresting = 0, correct = 0, broken = 0;
+
+	ssize_t n;
+	while ((n = getline(&linebuf, &linebufsz, fh)) >= 0) {
+		if (n == 0 || (n == 1 && linebuf[0] == '\n')) {
+			fprintf(stderr, "E: no line? empty line?\n");
+			rc = 2;
+			goto out;
+		}
+
+		if (linebuf[n-1] == '\n')
+			linebuf[--n] = '\0';
+
+		char *c = linebuf;
+
+		/* OK: filenum=1136 state=DONE size=1434971 err=0 ns=55069 */
+
+		char *status = strsep(&c, ":");
+		(void) status;
+
+		if (c == NULL || *c != ' ')
+			goto bad;
+		c++;
+
+		char *rfilenum = NULL, *rstate = NULL, *rsize = NULL;
+		char *rerr = NULL, *rns = NULL;
+
+		while (c) {
+			char *k = strsep(&c, "=");
+			if (c == NULL)
+				goto bad;
+			char *v = strsep(&c, " ");
+			if (strcmp(k, "filenum") == 0)
+				rfilenum = v;
+			else if (strcmp(k, "state") == 0)
+				rstate = v;
+			else if (strcmp(k, "size") == 0)
+				rsize = v;
+			else if (strcmp(k, "err") == 0)
+				rerr = v;
+			else if (strcmp(k, "ns") == 0)
+				rns = v;
+			else {
+				fprintf(stderr, "E: unknown key: %s\n", k);
+				rc = 2;
+				break;
+			}
+		}
+
+		/* XXX this could be more defensive but I got tired */
+		file_result_t res = {
+		    .filenum = atoi(rfilenum),
+		    .datasz = strtoul(rsize, NULL, 10),
+		    .err = atoi(rerr),
+		    .ns = strtoull(rns, NULL, 10),
+		};
+
+		for (res.state = 0;
+		    res.state < ARRAY_SIZE(file_state_str); res.state++)
+			if (strcmp(rstate, file_state_str[res.state]) == 0)
+				break;
+		if (res.state >= ARRAY_SIZE(file_state_str)) {
+			fprintf(stderr, "E: invalid state: %s\n", rstate);
+			rc = 2;
+			break;
+		}
+
+		file_check_result_t fcr = check_one_result(basedirfd, &res);
+		total++;
+		switch (fcr) {
+		case F_CR_UNINTERESTING:
+			uninteresting++;
+			break;
+		case F_CR_CORRECT:
+			correct++;
+			break;
+		case F_CR_BROKEN:
+			broken++;
+			break;
+		}
+
+		continue;
+
+bad:
+		fprintf(stderr, "E: bad parse: %s\n", c);
+		rc = 2;
+		break;
+	}
+
+	if (!feof(fh)) {
+		fprintf(stderr, "E: read from result file failed: %s\n",
+		    strerror(errno));
+		rc = 1;
+	}
+
+	if (rc == 0) {
+		printf("results: total=%u uninteresting=%u correct=%u %s=%u\n",
+		    total, uninteresting, correct,
+		    broken > 0 ? "BROKEN" : "broken", broken);
+		if (broken > 0)
+			rc = 3;
+	}
+
+out:
+	if (linebuf != NULL)
+		free(linebuf);
+	if (fh != NULL)
+		fclose(fh);
 	if (basedirfd >= 0)
 		close(basedirfd);
 
