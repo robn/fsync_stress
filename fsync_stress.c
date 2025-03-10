@@ -205,6 +205,12 @@ file_thread(void *arg)
 		}
 
 		res->state++;
+		if (fsync(fd) < 0) {
+			res->err = errno;
+			goto ferr;
+		}
+
+		res->state++;
 		if (close(fd) < 0)
 			res->err = errno;
 		else
