@@ -71,6 +71,15 @@ fill_random(uint8_t *v, size_t sz)
 	return (0);
 }
 
+static inline uint64_t
+now_ns(void)
+{
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return ((((uint64_t)ts.tv_sec) * 1000000000) + ts.tv_nsec);
+}
+
+
 typedef struct {
 	int basedirfd;
 	size_t minsz;
@@ -109,6 +118,7 @@ typedef struct {
 	file_state_t state;
 	size_t filesz;
 	int err;
+	uint64_t ns;
 } file_result_t;
 
 const char footer[] = "ENDOFLINE";
@@ -132,6 +142,7 @@ file_thread(void *arg)
 
 	while (!atomic_load(&t_exit)) {
 		int fd = -1, dirfd = -1;
+		uint64_t start_ns = 0, end_ns;
 
 		file_result_t *res = calloc(1, sizeof (file_result_t));
 
@@ -164,6 +175,8 @@ file_thread(void *arg)
 
 		res->filesz =
 		    (random() % (opts->maxsz+1-opts->minsz)) + opts->minsz;
+
+		start_ns = now_ns();
 
 		res->state++;
 		fd = openat(dirfd, filename_tmp,
@@ -218,6 +231,9 @@ file_thread(void *arg)
 		fd = -1;
 
 ferr:
+		end_ns = now_ns();
+		res->ns = start_ns > 0 ? end_ns - start_ns : 0;
+
 		if (fd >= 0)
 			close(fd);
 		if (dirfd >= 0)
@@ -403,10 +419,11 @@ main(int argc, char **argv)
 		pthread_mutex_unlock(&results_lock);
 
 		while (res != NULL) {
-			fprintf(resultfh,
-			    "%s: filenum=%u state=%s size=%lu err=%d\n",
+			fprintf(resultfh, "%s: filenum=%u state=%s size=%lu "
+			    "err=%d ns=%lu\n",
 			    res->err == 0 ? "OK" : "FAIL", res->filenum,
-			    file_state_str[res->state], res->filesz, res->err);
+			    file_state_str[res->state], res->filesz, res->err,
+			    res->ns / 1000);
 			void *next = res->next;
 			free(res);
 			res = next;
