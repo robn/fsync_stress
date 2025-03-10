@@ -1,0 +1,343 @@
+#!/usr/bin/env perl
+# 
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# Copyright (c) 2025, Klara, Inc.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE AUTHORS AND CONTRIBUTORS ``AS IS'' AND
+# ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHORS OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+# OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+# HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+# LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+# OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+# SUCH DAMAGE.
+#
+
+use v5.26;
+use warnings;
+use experimental qw(signatures);
+use utf8;
+use FindBin;
+use Path::Tiny;
+use Getopt::Std;
+use Term::ANSIColor qw(colored);
+
+$| = 1;
+
+sub usage {
+  print STDERR <<EOF;
+usage: fsync_stress_check [-r resultfile] <basedir>
+EOF
+  exit 1;
+}
+
+getopts('r:', \my %opts);
+my $resultfile = path($opts{r} // "result.log");
+my $basedir = @ARGV ? path(shift @ARGV) : usage();
+
+my $want_raw = ! -t \*STDOUT;
+
+my @xx_results = load_results($resultfile);
+my %xx_ondisk = get_ondisk($basedir);
+
+my %xx_seenpaths;
+my %xx_analysis;
+
+process_results(\@xx_results, \%xx_ondisk, \%xx_seenpaths, \%xx_analysis);
+process_unlogged(\%xx_ondisk, \%xx_seenpaths, \%xx_analysis);
+
+dump_result_analysis(\%xx_analysis);
+dump_broken(\%xx_analysis);
+
+
+#  @resultmeta = load_results($result_file);
+#  %ondisk = get_ondisk();
+#  process_results();
+#  process_unlogged();
+
+#  dump_result_analysis();
+#  dump_broken();
+
+
+sub load_results ($resultfile) {
+  say STDERR "I: loading results log";
+
+  my @results;
+  my $fh = $resultfile->filehandle('<');
+  while (<$fh>) {
+    chomp;
+    my ($status, $data) = m/(OK|FAIL): (.+)$/;
+    unless ($status && $data) {
+      say "weird line [$.]: $_";
+      next;
+    }
+    push @results, {
+      status => $status,
+      map { split /=/ } split /\s+/, $data,
+    };
+  }
+  close $fh;
+
+  return @results;
+}
+
+sub get_ondisk ($basedir) {
+  say STDERR "I: finding on-disk files";
+
+  opendir my $dh, $basedir or die "opendir: $basedir $!\n";
+  my @shards = grep { substr($_, 0, 1) ne '.' } readdir $dh;
+  closedir $dh;
+
+  my %ondisk;
+
+  for my $shard (@shards) {
+    my $path = "$basedir/$shard";
+    opendir my $dh, $path or die "opendir: $path: $!\n";
+    $ondisk{$_} = "$path/$_" for grep { substr($_, 0, 1) ne '.' } readdir $dh;
+    closedir $dh;
+  }
+
+  return %ondisk;
+}
+
+sub process_results ($results, $ondisk, $seenpaths, $analysis) {
+  my $nresults = scalar @$results;
+  printf STDERR "I: %d results to process\n", $nresults;
+  return unless $nresults;
+
+  my $n = 0;
+  for my $result (@$results) {
+    print "\33[2K\r$n" if !$want_raw && $n % 1000 == 0;
+
+    my ($status, $filenum, $state, $size, $err, $ns) =
+      @$result{qw(status filenum state size err ns)};
+    my $path = $ondisk->{$filenum};
+
+    my $problem;
+
+    if (!$path) {
+      $problem = "file not on disk";
+    }
+
+    my $fh;
+    unless ($problem) {
+      if (open $fh, '<', $path) {
+        $seenpaths->{$path} = 1;
+      }
+      else {
+        $problem = "open failed: $!";
+      };
+    }
+
+    my ($raw_size, $header, $footer);
+    unless ($problem) {
+      ($raw_size, $header, $footer, $problem) = check_file_contents($fh);
+    }
+
+    unless ($problem) {
+      if ($raw_size != $size + 8 + 9) { # 64-bit size_t + footer string
+        $problem = "size mismatch (on disk $raw_size, expected $size +13)";
+      }
+    }
+
+    unless ($problem) {
+      if ($header != $size) {
+        $problem = "size mismatch (frame $header, expected $size)";
+      }
+    }
+    if ($status eq 'OK' && $problem) {
+      # write sequence completed successly, but something is wrong with the
+      # on-disk file
+      record_result_analysis($analysis, $path, 'BROKEN', "reported success, but found problem: $problem");
+      push $analysis->{broken}->@*, [$result, $problem];
+    }
+    elsif ($status eq 'FAIL' && !$problem) {
+      # write sequence failed somewhere, but the on-disk file is correct
+      if ($state eq 'RENAME') {
+        record_result_analysis($analysis, $path, 'RENAME', "wrote correctly, but failed rename");
+      }
+      elsif ($state eq 'FSYNC') {
+        # the finishing sync failed but the file made it out to disk ok. the
+        # application likely doesn't know about it
+        record_result_analysis($analysis, $path, 'SYNC', "wrote correctly, but failed sync")
+      }
+      elsif ($state eq 'FOOTER') {
+        # the last write still made it to disk, lucky timing
+        record_result_analysis($analysis, $path, 'PRESYNC', "failed at last write, but still made it to disk");
+      }
+      else {
+        record_result_analysis($analysis, $path, 'IMPOSSIBLE', "file is correct but we never finished writing it?!");
+      }
+    }
+    elsif ($status eq 'FAIL') {
+      # write sequence failed somewhere, and the on-disk file is wrong too
+      if ($state eq 'OPEN') {
+        # failing at open is actually ok; workload only creates new files,
+        # so this is everything stopping before it began. but the file may have
+        # been created, so we have to check that specially
+        if ($problem ne 'file not on disk') {
+          record_result_analysis($analysis, $path, 'OPEN', "open failed, but dir entry was still created");
+        }
+        else {
+          # it isn't here, and we aren't expecting to be, so all is well
+          record_result_analysis($analysis, $path, 'OK', "failed at $state, and not on disk");
+        }
+      }
+      elsif ($state eq 'RENAME' && $problem eq 'file not on disk') {
+        # rename failed, and not on disk. that's expected; one half of the rename
+        # is going to go missing by design!
+      }
+      else {
+        # file is in an unknown state. its likely not a problem, as the sequence
+        # didn't complete and was reported as such
+        record_result_analysis($analysis, $path, 'UNKNOWN', "write failed at $state, problem found: $problem");
+      }
+    }
+    elsif ($status eq 'OK') {
+      # file is on disk where it should be, and was reported as such. nothing to
+      # see here!
+      record_result_analysis($analysis, $path, 'OK', "write sequence completed, file on disk correctly");
+    }
+
+    $n++;
+  }
+
+  print "\33[2K\r" unless $want_raw;
+}
+
+sub process_unlogged ($ondisk, $seenpaths, $analysis) {
+  say STDERR "I: finding unlogged files";
+
+  my @unlogged = sort grep { !$seenpaths->{$_} && -f $_ } keys %$ondisk;
+  my $nunlogged = scalar @unlogged;
+
+  printf STDERR "I: %d unlogged files to process\n", $nunlogged;
+
+  return unless $nunlogged;
+
+  my $n = 0;
+  for my $path (@unlogged) {
+    print "\33[2K\r$n" if !$want_raw && $n % 100 == 0;
+
+    my $problem;
+
+    my $fh;
+    unless (open $fh, '<', $path) {
+      $problem = "open failed: $!";
+    }
+
+    my ($raw_size, $header, $footer);
+    unless ($problem) {
+      ($raw_size, $header, $footer, $problem) = check_file_contents($fh);
+    }
+
+    if ($problem) {
+      record_result_analysis($analysis, $path, 'OK', "unlogged file, invalid: $problem");
+    }
+    else {
+      record_result_analysis($analysis, $path, 'OK', "unlogged file, valid");
+    }
+
+    $n++;
+  }
+
+  print "\33[2K\r" unless $want_raw;
+}
+
+sub check_file_contents ($fh) {
+  my ($raw_size, $header, $footer);
+
+  $raw_size = [stat $fh]->[7];
+
+  my $nread = sysread $fh, my $sizet, 8;
+  if (!defined $nread) {
+    return ($raw_size, $header, $footer, "header read failed: $!");
+  }
+  if ($nread < 4) {
+    return ($raw_size, $header, $footer, "header read: short read");
+  }
+  $header = sprintf '%u', unpack('Q', $sizet);
+
+  unless (sysseek $fh, $raw_size-9, 0) {
+    return ($raw_size, $header, $footer, "seek failed: $!");
+  }
+
+  $nread = sysread $fh, $footer, 9;
+  if (!defined $nread) {
+    return ($raw_size, $header, $footer, "footer read failed: $!");
+  }
+  if ($nread < 9) {
+    return ($raw_size, $header, $footer, "footer read: short read");
+  }
+
+  if ($footer ne 'ENDOFLINE') {
+    return ($raw_size, $header, $footer, "footer mismatch");
+  }
+
+  return ($raw_size, $header, $footer);
+}
+
+sub record_result_analysis ($analysis, $path, $category, $description) {
+  $analysis->{counts}{$category}{$description}++;
+  say "$path: $category: $description" if $want_raw && $category ne 'OK';
+}
+sub dump_result_analysis ($analysis) {
+  my %colour = (
+    BROKEN  => 'bright_red',
+
+    UNKNOWN    => 'bright_yellow',
+    PRESYNC    => 'bright_yellow',
+    IMPOSSIBLE => 'bright_yellow',
+    OPEN       => 'bright_yellow',
+
+    OK     => 'bright_green',
+    SYNC   => 'bright_green',
+    RENAME => 'bright_green',
+  );
+
+  print "\n";
+
+  my @categories = sort keys $analysis->{counts}->%*;
+
+  for my $category (@categories) {
+      my $pretty_category =
+        ($want_raw || !$colour{$category}) ?
+          $category :
+          colored([$colour{$category}], $category);
+
+      my @descriptions = 
+        sort { $analysis->{couts}{$category}{$b} <=> $analysis->{counts}{$category}{$a} }
+        keys $analysis->{counts}{$category}->%*;
+
+      for my $description (@descriptions) {
+          printf STDERR "%9d  %s: %s\n",
+            $analysis->{counts}{$category}{$description},
+            $pretty_category, $description;
+      }
+  }
+
+  print "\n";
+}
+
+sub dump_broken ($analysis) {
+  return unless $analysis->{broken} && $analysis->{broken}->@*;
+  say "BROKEN FILES (damaged on disk, but logged success):";
+  for my $record ($analysis->{broken}->@*) {
+    my ($r, $problem) = @$record;
+    say "  filenum=$r->{filenum} problem=$problem";
+  }
+  print "\n";
+}
