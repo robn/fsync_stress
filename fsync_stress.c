@@ -411,6 +411,7 @@ main(int argc, char **argv)
 			free(res);
 			res = next;
 		}
+		fflush(resultfh);
 
 		if (atomic_load(&t_exited) == nthreads) {
 			if (results != NULL)
