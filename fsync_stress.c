@@ -43,7 +43,7 @@ usage()
 {
 	fprintf(stderr,
 	    "usage:\n"
-	    "  fsync_stress -T [-n numthreads] [-t timeout]\n"
+	    "  fsync_stress -T [-n numthreads] [-t runtime]\n"
 	    "                  [-m minsz] [-M maxsz]\n"
 	    "                  <basedir> <resultfile>\n"
 	    "  fsync_stress -R <basedir> <resultfile>\n");
@@ -263,7 +263,7 @@ main(int argc, char **argv)
 	char *resultfile = NULL;
 	int do_test = 0, do_report = 0;
 	int nthreads = 10;
-	time_t runtime = 1;
+	time_t runtime = 10;
 	size_t minsz = 1024, maxsz = 1408*1024;
 
 	int c;
@@ -410,7 +410,7 @@ main(int argc, char **argv)
 		}
 	}
 
-	enum { RUNNING, EXITING, DONE, TIMEDOUT } runstate = RUNNING;
+	enum { RUNNING, EXITING, TIMEDOUT, DONE } runstate = RUNNING;
 	while (runstate < DONE) {
 		file_result_t *res = NULL;
 
@@ -426,12 +426,14 @@ main(int argc, char **argv)
 					goto out;
 				}
 
+				timeout.tv_sec += 10;
+
 				if (runstate == RUNNING) {
 					atomic_store(&t_exit, 1);
-					timeout.tv_sec += 10;
 					runstate = EXITING;
 				} else {
 					runstate = TIMEDOUT;
+					break;
 				}
 			}
 		}
@@ -452,19 +454,16 @@ main(int argc, char **argv)
 		}
 		fflush(resultfh);
 
-		if (atomic_load(&t_exited) == nthreads) {
-			if (results != NULL)
-				runstate = EXITING;
-			else
+		int exited = atomic_load(&t_exited);
+		if (exited == nthreads) {
+			if (results == NULL)
 				runstate = DONE;
+		} else if (runstate == TIMEDOUT) {
+			fprintf(stderr,
+			    "W: still waiting for %d/%d threads to exit; "
+			    "are they stuck? will continue to wait\n",
+			    nthreads-exited, nthreads);
 		}
-	}
-
-	if (runstate == TIMEDOUT) {
-		fprintf(stderr, "W: not all threads returned after exit "
-		    "signal; are they stuck? exiting without cleanup\n");
-		rc = 5;
-		goto out;
 	}
 
 	for (int i = 0; i < nthreads; i++)
