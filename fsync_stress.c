@@ -46,7 +46,7 @@ usage()
 	    "  fsync_stress -T [-n numthreads] [-t runtime]\n"
 	    "                  [-m minsz] [-M maxsz]\n"
 	    "                  <basedir> <resultfile>\n"
-	    "  fsync_stress -R <basedir> <resultfile>\n");
+	    "  fsync_stress -R [-s] <basedir> <resultfile>\n");
 	exit(1);
 }
 
@@ -254,7 +254,7 @@ ferr:
 }
 
 
-static int report_main(const char *basedir, const char *resultfile);
+static int report(const char *basedir, const char *resultfile, int stats);
 
 int
 main(int argc, char **argv)
@@ -265,6 +265,7 @@ main(int argc, char **argv)
 	int nthreads = 10;
 	time_t runtime = 10;
 	size_t minsz = 1024, maxsz = 1408*1024;
+	int stats = 0;
 
 	int c;
 	while ((c = getopt(argc, argv, "TRn:t:m:M:")) != -1) {
@@ -291,6 +292,9 @@ main(int argc, char **argv)
 			break;
 		case 'M':
 			maxsz = atoll(optarg);
+			break;
+		case 's':
+			stats = 1;
 			break;
 		default:
 			usage();
@@ -341,7 +345,7 @@ main(int argc, char **argv)
 	}
 
 	if (do_report)
-		return (report_main(basedir, resultfile));
+		return (report(basedir, resultfile, stats));
 
 	srandom(time(NULL));
 
@@ -579,8 +583,20 @@ broken:
 
 #define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))
 
+const char *time_bucket_str[] = {
+	"<1us",
+	"<10us",
+	"<100us",
+	"<1ms",
+	"<10ms",
+	"<100ms",
+	"<1s",
+	"<10s",
+	" 10s+",
+};
+
 static int
-report_main(const char *basedir, const char *resultfile)
+report(const char *basedir, const char *resultfile, int stats)
 {
 	int rc = 0;
 	int basedirfd = -1;
@@ -605,6 +621,9 @@ report_main(const char *basedir, const char *resultfile)
 	}
 
 	unsigned int total = 0, uninteresting = 0, correct = 0, broken = 0;
+	unsigned int err_total[256] = {};
+	unsigned int state_total[ARRAY_SIZE(file_state_str)] = {};
+	unsigned int time_buckets[ARRAY_SIZE(time_bucket_str)] = {};
 
 	ssize_t n;
 	while ((n = getline(&linebuf, &linebufsz, fh)) >= 0) {
@@ -685,6 +704,19 @@ report_main(const char *basedir, const char *resultfile)
 			break;
 		}
 
+		err_total[res.err]++;
+		state_total[res.state]++;
+
+		uint64_t t = res.ns / 1000;
+		unsigned int bucket = 0;
+		while (t > 0) {
+			t /= 10;
+			bucket++;
+		}
+		if (bucket >= ARRAY_SIZE(time_buckets))
+			bucket = ARRAY_SIZE(time_buckets)-1;
+		time_buckets[bucket]++;
+
 		continue;
 
 bad:
@@ -700,11 +732,36 @@ bad:
 	}
 
 	if (rc == 0) {
-		printf("results: total=%u uninteresting=%u correct=%u %s=%u\n",
+		printf("\nresults: total=%u uninteresting=%u correct=%u %s=%u\n",
 		    total, uninteresting, correct,
 		    broken > 0 ? "BROKEN" : "broken", broken);
 		if (broken > 0)
 			rc = 3;
+
+		if (stats) {
+			printf("\ntotals by errno:\n");
+			for (unsigned int i = 0; i < ARRAY_SIZE(err_total); i++) {
+				if (err_total[i] == 0)
+					continue;
+				printf("%8d  %d\n", i, err_total[i]);
+			}
+
+			printf("\ntotals by last state:\n");
+			for (unsigned int i = 0; i < ARRAY_SIZE(state_total); i++) {
+				if (state_total[i] == 0)
+					continue;
+				printf("%8s  %d\n", file_state_str[i], state_total[i]);
+			}
+
+			printf("\ntotals by elapsed time:\n");
+			for (unsigned int i = 0; i < ARRAY_SIZE(time_buckets); i++) {
+				if (time_buckets[i] == 0)
+					continue;
+				printf("%8s  %d\n", time_bucket_str[i], time_buckets[i]);
+			}
+		}
+
+		printf("\n");
 	}
 
 out:
